@@ -24,100 +24,90 @@ from core.models.payload_models import TrainResponse
 from core.models.utility_models import FileFormat
 from core.models.utility_models import TaskType
 from core.utils import download_s3_file
-from miner.config import WorkerConfig
-from miner.dependencies import get_worker_config
-from miner.logic.job_handler import create_job_diffusion
-from miner.logic.job_handler import create_job_text
+# from miner.config import WorkerConfig
+# from miner.dependencies import get_worker_config
+# from miner.logic.job_handler import create_job_diffusion
+# from miner.logic.job_handler import create_job_text
+import requests
 
 
 logger = get_logger(__name__)
+def setup_logging():
+    """
+    Configure logging to output to both console and file.
+    """
+    import logging
+    import sys
+    from logging.handlers import RotatingFileHandler
+    
+    # Create logs directory if it doesn't exist
+    os.makedirs("logs", exist_ok=True)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Clear existing handlers to avoid duplicate logs
+    if root_logger.handlers:
+        root_logger.handlers.clear()
+    
+    # Create formatters
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    # File handler with rotation
+    file_handler = RotatingFileHandler(
+        "logs/miner_tuning.log", 
+        maxBytes=50*1024*1024,  # 50MB
+        backupCount=5
+    )
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    return root_logger
+
+# Initialize logging
+setup_logging()
+
+
 
 current_job_finish_time = None
-
+ENDPOINT = os.getenv("ENDPOINT", "http://localhost:9999")
 
 async def tune_model_text(
     train_request: TrainRequestText,
-    worker_config: WorkerConfig = Depends(get_worker_config),
 ):
-    global current_job_finish_time
-    logger.info("Starting model tuning.")
-
-    current_job_finish_time = datetime.now() + timedelta(hours=train_request.hours_to_complete)
-    logger.info(f"Job received is {train_request}")
+    logger.info(f"train_request: {train_request.model_dump()}")
 
     try:
-        logger.info(train_request.file_format)
-        if train_request.file_format != FileFormat.HF:
-            if train_request.file_format == FileFormat.S3:
-                train_request.dataset = await download_s3_file(train_request.dataset)
-                logger.info(train_request.dataset)
-                train_request.file_format = FileFormat.JSON
-
+        url = f"{ENDPOINT}/train"
+        data = {
+            "train_request": train_request.model_dump(),
+        }
+        response = requests.post(url, json=data).json()
+        logger.info(f"my response for tune_model_text {train_request.task_id} is '{response}'")
+        return {"message": "Training job enqueued.", "task_id": train_request.task_id}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-    job = create_job_text(
-        job_id=str(train_request.task_id),
-        dataset=train_request.dataset,
-        model=train_request.model,
-        dataset_type=train_request.dataset_type,
-        file_format=train_request.file_format,
-        expected_repo_name=train_request.expected_repo_name,
-    )
-    logger.info(f"Created job {job}")
-    worker_config.trainer.enqueue_job(job)
-
-    return {"message": "Training job enqueued.", "task_id": job.job_id}
 
 
 async def tune_model_diffusion(
     train_request: TrainRequestImage,
-    worker_config: WorkerConfig = Depends(get_worker_config),
 ):
-    global current_job_finish_time
-    logger.info("Starting model tuning.")
-
-    current_job_finish_time = datetime.now() + timedelta(hours=train_request.hours_to_complete)
-    logger.info(f"Job received is {train_request}")
-    try:
-        train_request.dataset_zip = await download_s3_file(
-            train_request.dataset_zip, f"{cst.DIFFUSION_DATASET_DIR}/{train_request.task_id}.zip"
-        )
-        logger.info(train_request.dataset_zip)
-
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    job = create_job_diffusion(
-        job_id=str(train_request.task_id),
-        dataset_zip=train_request.dataset_zip,
-        model=train_request.model,
-        model_type=train_request.model_type,
-        expected_repo_name=train_request.expected_repo_name,
-    )
-    logger.info(f"Created job {job}")
-    worker_config.trainer.enqueue_job(job)
-
-    return {"message": "Training job enqueued.", "task_id": job.job_id}
+    return {"message": "Training job enqueued.", "task_id": "xxx"}
 
 
 async def get_latest_model_submission(task_id: str) -> str:
+    logger.info(f"get_latest_model_submission: {task_id}")
     try:
-        # Temporary work around in order to not change the vali a lot
-        # Could send the task type from vali instead of matching file names
-        config_filename = f"{task_id}.yml"
-        config_path = os.path.join(cst.CONFIG_DIR, config_filename)
-        if os.path.exists(config_path):
-            with open(config_path, "r") as file:
-                config_data = yaml.safe_load(file)
-                return config_data.get("hub_model_id", None)
-        else:
-            config_filename = f"{task_id}.toml"
-            config_path = os.path.join(cst.CONFIG_DIR, config_filename)
-            with open(config_path, "r") as file:
-                config_data = toml.load(file)
-                return config_data.get("huggingface_repo_id", None)
-
+        params = {"miner_uid": -1, "task_id": task_id}
+        response = requests.post(f"{ENDPOINT}/submision", params=params).json()
+        logger.info(f"my response for {task_id} is '{response}'")
+        return response["result"]
     except FileNotFoundError as e:
         logger.error(f"No submission found for task {task_id}: {str(e)}")
         raise HTTPException(status_code=404, detail=f"No model submission found for task {task_id}")
@@ -131,36 +121,24 @@ async def get_latest_model_submission(task_id: str) -> str:
 
 async def task_offer(
     request: MinerTaskOffer,
-    config: Config = Depends(get_config),
-    worker_config: WorkerConfig = Depends(get_worker_config),
 ) -> MinerTaskResponse:
+    logger.info(f"task_offer: {request.model_dump()}")
     try:
-        logger.info("An offer has come through")
-        # You will want to optimise this as a miner
-        global current_job_finish_time
-        current_time = datetime.now()
-        if request.task_type not in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK]:
+        if request.task_type not in [TaskType.INSTRUCTTEXTTASK]:
+            logger.info(f"task type is not instruct text task")
             return MinerTaskResponse(
-                message=f"This endpoint only accepts text tasks: "
-                        f"{TaskType.INSTRUCTTEXTTASK} and {TaskType.DPOTASK}",
-                accepted=False
-            )
-
-        if "llama" not in request.model.lower():
-            return MinerTaskResponse(message="I'm not yet optimised and only accept llama-type jobs", accepted=False)
-
-        if current_job_finish_time is None or current_time + timedelta(hours=1) > current_job_finish_time:
-            if request.hours_to_complete < 13:
-                logger.info("Accepting the offer - ty snr")
-                return MinerTaskResponse(message=f"Yes. I can do {request.task_type} jobs", accepted=True)
-            else:
-                logger.info("Rejecting offer")
-                return MinerTaskResponse(message="I only accept small jobs", accepted=False)
-        else:
-            return MinerTaskResponse(
-                message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
+                message="I only accept text tasks",
                 accepted=False,
             )
+            
+        url = f"{ENDPOINT}/acceptance"
+        data = request.model_dump()
+        response = requests.post(url, json=data).json()
+        logger.info(f"my response for {request.task_id} is '{response}'")
+        return MinerTaskResponse(
+            message=response["error"] if response["error"] else "I can handle this model",
+            accepted=response["accepted"],
+        )
 
     except ValidationError as e:
         logger.error(f"Validation error: {str(e)}")
@@ -173,29 +151,13 @@ async def task_offer(
 
 async def task_offer_image(
     request: MinerTaskOffer,
-    config: Config = Depends(get_config),
-    worker_config: WorkerConfig = Depends(get_worker_config),
 ) -> MinerTaskResponse:
+    logger.info(f"task_offer_image: {request.model_dump()}")
     try:
-        logger.info("An image offer has come through")
-        global current_job_finish_time
-        current_time = datetime.now()
-
-        if request.task_type != TaskType.IMAGETASK:
-            return MinerTaskResponse(message="This endpoint only accepts image tasks", accepted=False)
-
-        if current_job_finish_time is None or current_time + timedelta(hours=1) > current_job_finish_time:
-            if request.hours_to_complete < 3:
-                logger.info("Accepting the image offer")
-                return MinerTaskResponse(message="Yes. I can do image jobs", accepted=True)
-            else:
-                logger.info("Rejecting offer - too long")
-                return MinerTaskResponse(message="I only accept small jobs", accepted=False)
-        else:
-            return MinerTaskResponse(
-                message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
-                accepted=False,
-            )
+        return MinerTaskResponse(
+            message="I only accept text tasks",
+            accepted=False,
+        )
 
     except ValidationError as e:
         logger.error(f"Validation error: {str(e)}")
